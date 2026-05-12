@@ -125,6 +125,31 @@ def fetch_price_fdr(code: str):
     return None
 
 
+def fetch_price_naver(code: str):
+    """네이버 금융 종목 페이지에서 현재가 — 한국 종목 최종 폴백 (신규 ETF 대응)"""
+    try:
+        url = f"https://finance.naver.com/item/main.naver?code={code}"
+        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
+        r.encoding = "euc-kr"
+        soup = BeautifulSoup(r.text, "lxml")
+        # 현재가는 .no_today .blind 또는 #_nowVal 에 있음
+        no_today = soup.select_one(".no_today .blind") or soup.select_one("#_nowVal")
+        if no_today:
+            text = no_today.get_text(strip=True).replace(",", "")
+            m = re.search(r"(\d+(?:\.\d+)?)", text)
+            if m:
+                return float(m.group(1))
+        # 보조: dl.blind 안의 "현재가" 다음 dd
+        for dl in soup.select("dl.blind"):
+            items = dl.get_text(" ", strip=True)
+            m = re.search(r"현재가\s*([\d,]+)", items)
+            if m:
+                return float(m.group(1).replace(",", ""))
+    except Exception as e:
+        print(f"[NAVER_PRICE/{code}] {e}", file=sys.stderr)
+    return None
+
+
 # =============================================================================
 # 이동평균선
 # =============================================================================
@@ -623,6 +648,11 @@ def enrich_holdings(holdings: list[dict]):
             price, fund = fetch_price_yahoo(h["yahoo"])
         if price is None and h.get("fdr"):
             price = fetch_price_fdr(h["fdr"])
+        # 한국 종목 최종 폴백: 네이버 (신규 ETF/ETN 대응)
+        if price is None and h.get("market") == "KR" and h.get("fdr"):
+            price = fetch_price_naver(h["fdr"])
+            if price is not None:
+                print(f"[NAVER_PRICE/{h['fdr']}] {h['name']} = {price}")
 
         cost = h.get("cost")
         qty = h.get("qty", 0)
@@ -720,43 +750,4 @@ def main():
         "top_value": fetch_top_value_stocks(limit=10),
         "top_gainers": fetch_top_change_stocks(limit=5, ascending=False),
         "top_losers": fetch_top_change_stocks(limit=5, ascending=True),
-        "themes": fetch_naver_themes(limit=10),
-    }
-
-    total_cost = sum(a["cost"] for a in accounts)
-    total_eval = sum(a["evalv"] for a in accounts)
-    total_pl = total_eval - total_cost
-    total_ret = (total_pl / total_cost * 100) if total_cost else 0
-
-    payload = {
-        "fx": round(fx, 2),
-        "kospi": {
-            "close": round(kospi_close, 2) if kospi_close else None,
-            "change_pct": round(kospi_chg, 2) if kospi_chg is not None else None,
-        },
-        "holdings": holdings,
-        "accounts": accounts,
-        "totals": {
-            "cost": int(total_cost), "evalv": int(total_eval),
-            "pl": int(total_pl), "ret": round(total_ret, 2),
-        },
-        "news_by_holding": news_map,
-        "ma_by_holding": ma_map,
-        "m7": m7,
-        "market_flow": flow,
-        "sector_indices": sectors,
-        "market_keywords": keywords,
-        "updated_at": datetime.now(KST).isoformat(timespec="seconds"),
-    }
-
-    html = render_html(payload)
-    (DIST / "index.html").write_text(html, encoding="utf-8")
-    (DIST / "data.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8"
-    )
-    print(f"=== 완료 — 총자산 {total_eval:,.0f}원 ({total_ret:+.2f}%) ===")
-
-
-if __name__ == "__main__":
-    main()
+        "themes": fetch_n
