@@ -21,7 +21,7 @@
       "market": "US",
       "category": "Stock",
       "qty": 0.004866,
-      "cost_usd_approx": 297,
+      "cost": 297,
       "ccy": "USD",
       "yahoo": "META",
       "note": "소수점 매수, 매입가 정보 부정확"
@@ -94,8 +94,8 @@
       "qty": 2000,
       "cost": 3479,
       "ccy": "KRW",
-      "yahoo": "530055.KS",
-      "fdr": "530055"
+      "yahoo": "580020.KS",
+      "fdr": "580020"
     },
     {
       "name": "TIGER 200",
