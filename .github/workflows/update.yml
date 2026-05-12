@@ -1,0 +1,54 @@
+name: 포트폴리오 자동 갱신
+
+on:
+  schedule:
+    # 한국시간 = UTC + 9시간
+    # 한국시간 09:00 → UTC 00:00 (미국 시장 마감 후)
+    - cron: '0 0 * * *'
+    # 한국시간 16:00 → UTC 07:00 (한국 시장 마감 직후)
+    - cron: '0 7 * * *'
+  workflow_dispatch: # 사용자가 GitHub 웹에서 수동 실행 가능
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 동시에 한 번만 실행되도록 (충돌 방지)
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 포트폴리오 데이터 갱신
+        run: python update_portfolio.py
+
+      - name: Pages 설정
+        uses: actions/configure-pages@v5
+
+      - name: Pages 아티팩트 업로드
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './dist'
+
+      - name: GitHub Pages 배포
+        id: deployment
+        uses: actions/deploy-pages@v4
