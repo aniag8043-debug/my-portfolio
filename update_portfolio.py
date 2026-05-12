@@ -1,13 +1,15 @@
 """
-포트폴리오 자동 갱신 스크립트 v3
+포트폴리오 자동 갱신 스크립트 v5
 - 시세 + 환율 + 코스피
 - 종목별 뉴스 (yfinance + 네이버)
-- 시장 수급 (KOSPI/KOSDAQ 외/기/개)
-- M7 데일리 (yfinance)
-- 종목별 이동평균선 5/20/120일·50주 (신규)
-- 21개 업종지수 등락률·거래대금 (신규)
+- 시장 수급 (네이버 모바일 API)         ★ v5: KRX 차단 우회
+- 업종지수 (네이버 sise_group 크롤링)    ★ v5: KRX 차단 우회
+- 시장 키워드 (네이버 거래대금/등락률 크롤링) ★ v5: KRX 차단 우회
+- M7 데일리 (yfinance) + 한글 뉴스       ★ v5: 영문 뉴스 → 네이버 한글 뉴스
+- 종목별 이동평균선 5/20/120일·50주
 """
 import json
+import re
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -33,6 +35,10 @@ DIST.mkdir(exist_ok=True)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 )
 
 
@@ -120,10 +126,9 @@ def fetch_price_fdr(code: str):
 
 
 # =============================================================================
-# 신규: 이동평균선 5/20/120일 + 50주(=250영업일)
+# 이동평균선
 # =============================================================================
 def compute_moving_averages(df) -> dict:
-    """일봉 DataFrame에서 이평선 + 미니 시계열(최근 60일) 반환."""
     if df is None or df.empty or "close" not in df.columns or len(df) < 5:
         return None
 
@@ -141,18 +146,15 @@ def compute_moving_averages(df) -> dict:
         result["ma20"] = round(float(closes.rolling(20).mean().iloc[-1]), 2)
     if len(closes) >= 120:
         result["ma120"] = round(float(closes.rolling(120).mean().iloc[-1]), 2)
-    # 50주선 = 250영업일 평균 (50주 × 5일)
     if len(closes) >= 250:
         result["ma50w"] = round(float(closes.rolling(250).mean().iloc[-1]), 2)
 
-    # 미니 차트용 최근 60일
     recent = closes.tail(60)
     result["series"] = [round(float(v), 2) for v in recent.values]
     result["dates"] = [
         d.strftime("%m.%d") if hasattr(d, "strftime") else str(d)
         for d in recent.index
     ]
-    # 이평선 시계열도 같이 (60일분)
     if len(closes) >= 5:
         result["ma5_series"] = [
             round(float(v), 2) if v == v else None
@@ -164,7 +166,6 @@ def compute_moving_averages(df) -> dict:
             for v in closes.rolling(20).mean().tail(60).values
         ]
 
-    # 현재가 vs 이평선 위치 분석
     flags = {}
     for k in ["ma5", "ma20", "ma120", "ma50w"]:
         if result[k] is not None:
@@ -175,9 +176,94 @@ def compute_moving_averages(df) -> dict:
 
 
 # =============================================================================
-# 뉴스 — 미국
+# 뉴스 — 미국 (★ v5: 네이버 한글 뉴스로 교체)
 # =============================================================================
+# 미국 종목 → 네이버 종목코드 매핑 (필요시 확장)
+US_NAVER_SYMBOL_MAP = {
+    "AAPL": "AAPL.O",
+    "MSFT": "MSFT.O",
+    "GOOGL": "GOOGL.O",
+    "AMZN": "AMZN.O",
+    "META": "META.O",
+    "NVDA": "NVDA.O",
+    "TSLA": "TSLA.O",
+    "PLTR": "PLTR.O",
+    "SDGR": "SDGR.O",
+    "CCL": "CCL",      # NYSE
+    "BOIL": "BOIL",    # NYSE Arca
+}
+
+
 def fetch_news_us(ticker: str, limit: int = 5) -> list[dict]:
+    """미국 종목 한글 뉴스 — 네이버 모바일 API"""
+    naver_symbol = US_NAVER_SYMBOL_MAP.get(ticker, f"{ticker}.O")
+    url = f"https://m.stock.naver.com/api/news/worldstock/{naver_symbol}"
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": MOBILE_UA, "Accept": "application/json"},
+            params={"pageSize": limit * 2, "page": 1},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            print(f"[NEWS_US/{ticker}] HTTP {r.status_code}", file=sys.stderr)
+            return _fetch_news_us_fallback(ticker, limit)
+
+        data = r.json()
+        # 응답 구조 보호 처리
+        items = []
+        if isinstance(data, list):
+            # 목록이 직접 리스트로 올 수도, 또는 그룹된 형태로 올 수도 있음
+            for group in data:
+                if isinstance(group, dict):
+                    if "items" in group and isinstance(group["items"], list):
+                        items.extend(group["items"])
+                    else:
+                        items.append(group)
+        elif isinstance(data, dict):
+            items = data.get("items") or data.get("articles") or data.get("list") or []
+
+        out = []
+        for it in items[:limit]:
+            if not isinstance(it, dict):
+                continue
+            title = (
+                it.get("title") or it.get("articleTitle")
+                or it.get("officeName") or ""
+            )
+            office = it.get("officeName") or it.get("source") or "네이버 금융"
+            office_id = it.get("officeId") or ""
+            article_id = it.get("articleId") or it.get("aid") or ""
+            pub = it.get("datetime") or it.get("pubDate") or it.get("articleDateTime") or ""
+
+            # 네이버 뉴스 URL 조립
+            news_url = ""
+            if office_id and article_id:
+                news_url = f"https://n.news.naver.com/article/{office_id}/{article_id}"
+            elif it.get("originalLink"):
+                news_url = it["originalLink"]
+            elif it.get("link"):
+                news_url = it["link"]
+
+            if title:
+                out.append({
+                    "title": str(title).strip(),
+                    "url": news_url,
+                    "pub": str(pub).strip(),
+                    "source": str(office).strip(),
+                })
+
+        if out:
+            return out
+        # 빈 응답이면 폴백
+        return _fetch_news_us_fallback(ticker, limit)
+    except Exception as e:
+        print(f"[NEWS_US/{ticker}] {e}", file=sys.stderr)
+        return _fetch_news_us_fallback(ticker, limit)
+
+
+def _fetch_news_us_fallback(ticker: str, limit: int = 5) -> list[dict]:
+    """폴백 — yfinance 영문 뉴스 (네이버 실패 시)"""
     try:
         t = yf.Ticker(ticker)
         items = t.news or []
@@ -192,10 +278,13 @@ def fetch_news_us(ticker: str, limit: int = 5) -> list[dict]:
             if isinstance(pub, (int, float)):
                 pub = datetime.fromtimestamp(pub, tz=timezone.utc).isoformat()
             if title:
-                out.append({"title": title, "url": url, "pub": pub, "source": "Yahoo Finance"})
+                out.append({
+                    "title": title, "url": url, "pub": pub,
+                    "source": "Yahoo Finance (영문)",
+                })
         return out
     except Exception as e:
-        print(f"[NEWS/{ticker}] {e}", file=sys.stderr)
+        print(f"[NEWS_US_FB/{ticker}] {e}", file=sys.stderr)
         return []
 
 
@@ -234,186 +323,204 @@ def fetch_news_kr(code: str, limit: int = 5) -> list[dict]:
 
 
 # =============================================================================
-# 시장 수급 (외/기/개) — 기존
+# ★ v5: 시장 수급 — 네이버 모바일 API
 # =============================================================================
 def fetch_market_flow() -> dict:
-    if not PYKRX_OK:
-        return {"available": False, "reason": "pykrx 모듈 import 실패"}
-
-    today = datetime.now(KST).date()
-    start = (today - timedelta(days=10)).strftime("%Y%m%d")
-    end = today.strftime("%Y%m%d")
-
+    """KOSPI/KOSDAQ 일별 외/기/개 수급 (네이버 모바일 API)"""
     out = {"available": True, "markets": {}}
-    for market_code, market_name in [("KOSPI", "코스피"), ("KOSDAQ", "코스닥")]:
+
+    for market_code, market_name, api_code in [
+        ("KOSPI", "코스피", "KOSPI"),
+        ("KOSDAQ", "코스닥", "KOSDAQ"),
+    ]:
+        url = f"https://m.stock.naver.com/api/index/{api_code}/investors"
         try:
-            df = pykrx_stock.get_market_trading_value_by_date(start, end, market_code)
-            if df is None or df.empty:
+            r = requests.get(
+                url,
+                headers={"User-Agent": MOBILE_UA, "Accept": "application/json"},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                print(f"[FLOW/{market_code}] HTTP {r.status_code}", file=sys.stderr)
                 continue
-            df = df.tail(5)
+            data = r.json()
+            if not isinstance(data, list):
+                continue
+
             recs = []
-            for idx, row in df.iterrows():
+            for row in data[:5]:
+                if not isinstance(row, dict):
+                    continue
+                # 네이버 API: localTradedAt(YYYYMMDD), foreigner, institution, individual (단위: 백만원으로 추정)
+                date_raw = str(row.get("localTradedAt", ""))
+                if len(date_raw) == 8:
+                    date_str = f"{date_raw[4:6]}.{date_raw[6:8]}"
+                else:
+                    date_str = date_raw
+
                 recs.append({
-                    "date": idx.strftime("%m.%d") if hasattr(idx, "strftime") else str(idx),
-                    "foreign": int(row.get("외국인합계", 0) or 0),
-                    "institution": int(row.get("기관합계", 0) or 0),
-                    "individual": int(row.get("개인", 0) or 0),
+                    "date": date_str,
+                    "foreign": int(row.get("foreigner", 0) or 0),
+                    "institution": int(row.get("institution", 0) or 0),
+                    "individual": int(row.get("individual", 0) or 0),
                 })
-            out["markets"][market_name] = recs
+            if recs:
+                out["markets"][market_name] = recs
         except Exception as e:
             print(f"[FLOW/{market_code}] {e}", file=sys.stderr)
+
+    if not out["markets"]:
+        out["available"] = False
+        out["reason"] = "네이버 응답 없음"
     return out
 
 
 # =============================================================================
-# 신규: 21개 업종지수 등락률·거래대금
+# ★ v5: 업종지수 — 네이버 sise_group 크롤링
 # =============================================================================
+def _parse_pct(text: str):
+    """+1.23% 또는 -1.23% 같은 문자열 → float"""
+    if not text:
+        return 0.0
+    m = re.search(r"([+-]?\d+\.?\d*)", text.replace(",", ""))
+    if m:
+        return float(m.group(1))
+    return 0.0
+
+
+def _parse_int(text: str):
+    """천 단위 콤마 있는 숫자 → int"""
+    if not text:
+        return 0
+    digits = re.sub(r"[^\d]", "", text)
+    return int(digits) if digits else 0
+
+
 def fetch_sector_indices() -> dict:
-    """KOSPI 업종지수 — 최근 영업일 종가/등락률/거래대금."""
-    if not PYKRX_OK:
-        return {"available": False, "reason": "pykrx 미설치"}
-
-    today = datetime.now(KST).date()
-    # 영업일 가변성 대비, 최근 10일 검색해서 마지막 2개 사용
-    start = (today - timedelta(days=15)).strftime("%Y%m%d")
-    end = today.strftime("%Y%m%d")
-
-    sectors = []
+    """KOSPI 업종 시세 — 네이버 sise_group?type=upjong"""
+    url = "https://finance.naver.com/sise/sise_group.naver?type=upjong"
     try:
-        # KOSPI 시장의 업종 지수 목록 (1001=KOSPI, 1002~1004=대/중/소형주, 1005~=업종)
-        all_indices = pykrx_stock.get_index_ticker_list(market="KOSPI")
-        for ticker in all_indices:
-            # 업종지수만 (1005부터): 음식료품, 섬유의복, ... 서비스업
-            if not ticker.startswith("1") or len(ticker) != 4:
+        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
+        r.encoding = "euc-kr"
+        soup = BeautifulSoup(r.text, "lxml")
+
+        sectors = []
+        table = soup.select_one("table.type_1")
+        if not table:
+            return {"available": False, "reason": "테이블 없음"}
+
+        for row in table.select("tbody tr"):
+            tds = row.select("td")
+            if len(tds) < 5:
                 continue
-            try:
-                num = int(ticker)
-                # 1005 ~ 1099 범위가 업종지수, 그 외 (1001~1004)는 시장 전체/규모별
-                if num < 1005 or num > 1099:
-                    continue
-            except ValueError:
+            name_a = tds[0].select_one("a")
+            if not name_a:
                 continue
 
-            try:
-                name = pykrx_stock.get_index_ticker_name(ticker)
-                df = pykrx_stock.get_index_ohlcv_by_date(start, end, ticker)
-                if df is None or len(df) < 2:
-                    continue
-                close = float(df["종가"].iloc[-1])
-                prev = float(df["종가"].iloc[-2])
-                # 거래대금 컬럼명은 버전에 따라 '거래대금' 또는 다른 명칭
-                value = 0
-                for col in ["거래대금", "거래량"]:
-                    if col in df.columns:
-                        value = float(df[col].iloc[-1])
-                        break
-                sectors.append({
-                    "code": ticker,
-                    "name": name,
-                    "close": round(close, 2),
-                    "change_pct": round((close - prev) / prev * 100, 2),
-                    "value": int(value),
-                })
-            except Exception as e:
-                print(f"[SECTOR/{ticker}] {e}", file=sys.stderr)
-        # 거래대금 내림차순 정렬
-        sectors.sort(key=lambda s: -s.get("value", 0))
+            name = name_a.get_text(strip=True)
+            change_text = tds[1].get_text(strip=True)  # 전일대비 (%)
+            # 보통: 컬럼 = 업종명 / 전일대비 / 상승종목수 / 보합 / 하락
+            sectors.append({
+                "code": "",
+                "name": name,
+                "close": 0,
+                "change_pct": _parse_pct(change_text),
+                "value": 0,  # 네이버 업종 페이지는 거래대금 미제공 → 별도 처리
+            })
+
+        # 등락률 정렬
+        sectors.sort(key=lambda s: -s["change_pct"])
+
+        if not sectors:
+            return {"available": False, "reason": "업종 데이터 없음"}
+        return {"available": True, "sectors": sectors}
     except Exception as e:
-        print(f"[SECTOR_LIST] {e}", file=sys.stderr)
+        print(f"[SECTOR] {e}", file=sys.stderr)
         return {"available": False, "reason": str(e)}
 
-    return {"available": True, "sectors": sectors}
-
 
 # =============================================================================
-# 신규: 시장 키워드 (거래대금/등락률 TOP + 네이버 테마)
+# ★ v5: 시장 키워드 — 네이버 거래대금/등락률 TOP 크롤링
 # =============================================================================
-def _last_business_date_str() -> str:
-    """최근 영업일 (오늘이 영업일이면 오늘, 아니면 직전 영업일) YYYYMMDD."""
-    today = datetime.now(KST).date()
-    for delta in range(0, 10):
-        d = today - timedelta(days=delta)
-        date_str = d.strftime("%Y%m%d")
-        try:
-            df = pykrx_stock.get_market_ohlcv_by_ticker(date_str, market="KOSPI")
-            if df is not None and not df.empty:
-                return date_str
-        except Exception:
-            continue
-    return today.strftime("%Y%m%d")
-
-
 def fetch_top_value_stocks(limit: int = 10) -> list[dict]:
-    """KOSPI+KOSDAQ 통합 거래대금 상위 종목."""
-    if not PYKRX_OK:
-        return []
-    try:
-        date_str = _last_business_date_str()
-        rows = []
-        for market in ["KOSPI", "KOSDAQ"]:
-            try:
-                df = pykrx_stock.get_market_ohlcv_by_ticker(date_str, market=market)
-                if df is None or df.empty:
+    """거래대금 상위 — 네이버 sise_quant.naver (코스피+코스닥 통합)"""
+    rows = []
+    # sosok=0 (KOSPI), sosok=1 (KOSDAQ)
+    for sosok, market_name in [("0", "KOSPI"), ("1", "KOSDAQ")]:
+        url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}&page=1"
+        try:
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
+            r.encoding = "euc-kr"
+            soup = BeautifulSoup(r.text, "lxml")
+            table = soup.select_one("table.type_2")
+            if not table:
+                continue
+            for tr in table.select("tbody tr"):
+                tds = tr.select("td")
+                if len(tds) < 11:
                     continue
-                df = df.sort_values("거래대금", ascending=False).head(limit * 2)
-                for ticker, row in df.iterrows():
-                    try:
-                        name = pykrx_stock.get_market_ticker_name(ticker)
-                    except Exception:
-                        name = ticker
-                    rows.append({
-                        "ticker": ticker,
-                        "name": name,
-                        "market": market,
-                        "close": float(row.get("종가", 0)),
-                        "change_pct": float(row.get("등락률", 0)),
-                        "value": int(row.get("거래대금", 0)),
-                    })
-            except Exception as e:
-                print(f"[TOP_VALUE/{market}] {e}", file=sys.stderr)
-        rows.sort(key=lambda r: -r["value"])
-        return rows[:limit]
-    except Exception as e:
-        print(f"[TOP_VALUE] {e}", file=sys.stderr)
-        return []
+                name_a = tds[1].select_one("a")
+                if not name_a:
+                    continue
+                href = name_a.get("href", "")
+                m = re.search(r"code=(\d+)", href)
+                ticker = m.group(1) if m else ""
+
+                rows.append({
+                    "ticker": ticker,
+                    "name": name_a.get_text(strip=True),
+                    "market": market_name,
+                    "close": _parse_int(tds[2].get_text(strip=True)),
+                    "change_pct": _parse_pct(tds[4].get_text(strip=True)),
+                    "value": _parse_int(tds[7].get_text(strip=True)) * 1_000_000,  # 거래대금(백만원) → 원
+                })
+        except Exception as e:
+            print(f"[TOP_VALUE/{sosok}] {e}", file=sys.stderr)
+    rows.sort(key=lambda r: -r["value"])
+    return rows[:limit]
 
 
-def fetch_top_change_stocks(limit: int = 5, ascending: bool = False, min_value: int = 1_000_000_000) -> list[dict]:
-    """등락률 상위(하락) 종목. min_value 이상 거래대금만(잡주 제거)."""
-    if not PYKRX_OK:
-        return []
-    try:
-        date_str = _last_business_date_str()
-        rows = []
-        for market in ["KOSPI", "KOSDAQ"]:
-            try:
-                df = pykrx_stock.get_market_ohlcv_by_ticker(date_str, market=market)
-                if df is None or df.empty:
+def fetch_top_change_stocks(limit: int = 5, ascending: bool = False) -> list[dict]:
+    """상승률/하락률 상위 — 네이버 sise_rise/fall (코스피+코스닥 통합)"""
+    rows = []
+    page_name = "sise_fall.naver" if ascending else "sise_rise.naver"
+    for sosok, market_name in [("0", "KOSPI"), ("1", "KOSDAQ")]:
+        url = f"https://finance.naver.com/sise/{page_name}?sosok={sosok}&page=1"
+        try:
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
+            r.encoding = "euc-kr"
+            soup = BeautifulSoup(r.text, "lxml")
+            table = soup.select_one("table.type_2")
+            if not table:
+                continue
+            for tr in table.select("tbody tr"):
+                tds = tr.select("td")
+                if len(tds) < 11:
                     continue
-                df = df[df["거래대금"] >= min_value]
-                df = df.sort_values("등락률", ascending=ascending).head(limit * 2)
-                for ticker, row in df.iterrows():
-                    try:
-                        name = pykrx_stock.get_market_ticker_name(ticker)
-                    except Exception:
-                        name = ticker
-                    rows.append({
-                        "ticker": ticker, "name": name, "market": market,
-                        "close": float(row.get("종가", 0)),
-                        "change_pct": float(row.get("등락률", 0)),
-                        "value": int(row.get("거래대금", 0)),
-                    })
-            except Exception as e:
-                print(f"[TOP_CHG/{market}] {e}", file=sys.stderr)
-        rows.sort(key=lambda r: r["change_pct"] if ascending else -r["change_pct"])
-        return rows[:limit]
-    except Exception as e:
-        print(f"[TOP_CHG] {e}", file=sys.stderr)
-        return []
+                name_a = tds[1].select_one("a")
+                if not name_a:
+                    continue
+                href = name_a.get("href", "")
+                m = re.search(r"code=(\d+)", href)
+                ticker = m.group(1) if m else ""
+
+                rows.append({
+                    "ticker": ticker,
+                    "name": name_a.get_text(strip=True),
+                    "market": market_name,
+                    "close": _parse_int(tds[2].get_text(strip=True)),
+                    "change_pct": _parse_pct(tds[4].get_text(strip=True)),
+                    "value": _parse_int(tds[7].get_text(strip=True)) * 1_000_000,
+                })
+        except Exception as e:
+            print(f"[TOP_CHG/{sosok}/{page_name}] {e}", file=sys.stderr)
+    # 절댓값 큰 순 (상승: 큰 양수가 앞 / 하락: 큰 음수가 앞)
+    rows.sort(key=lambda r: r["change_pct"] if ascending else -r["change_pct"])
+    return rows[:limit]
 
 
 def fetch_naver_themes(limit: int = 10) -> list[dict]:
-    """네이버 금융 테마 상승률 상위."""
+    """네이버 금융 테마 등락률 상위 — 기존 유지"""
     try:
         url = "https://finance.naver.com/sise/theme.naver?&page=1"
         r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
@@ -421,7 +528,6 @@ def fetch_naver_themes(limit: int = 10) -> list[dict]:
         soup = BeautifulSoup(r.text, "lxml")
 
         themes = []
-        # 메인 테이블 - 클래스명이 시기마다 다를 수 있음, 여러 패턴 시도
         for table_sel in ["table.type_1.theme", "table.type_1", ".theme_main table"]:
             table = soup.select_one(table_sel)
             if not table:
@@ -437,7 +543,6 @@ def fetch_naver_themes(limit: int = 10) -> list[dict]:
                 href = name_a.get("href", "")
                 theme_url = ("https://finance.naver.com" + href) if href.startswith("/") else href
 
-                # 등락률 — 보통 2번째 또는 3번째 컬럼
                 change_text = None
                 for td in tds[1:4]:
                     txt = td.get_text(strip=True).replace(" ", "")
@@ -445,7 +550,6 @@ def fetch_naver_themes(limit: int = 10) -> list[dict]:
                         change_text = txt
                         break
 
-                # 대표 종목 — 마지막 컬럼들에서 a 태그 찾기
                 top_stocks = []
                 for td in tds[-3:]:
                     for a in td.select("a"):
@@ -496,7 +600,7 @@ def fetch_m7_daily() -> list[dict]:
                 "price": round(close, 2),
                 "change_pct": round(chg_pct, 2),
                 "mcap": info.get("marketCap"),
-                "headlines": fetch_news_us(ticker, limit=2),
+                "headlines": fetch_news_us(ticker, limit=2),  # ★ 한글 뉴스
             })
         except Exception as e:
             print(f"[M7/{ticker}] {e}", file=sys.stderr)
@@ -539,13 +643,11 @@ def enrich_holdings(holdings: list[dict]):
             h["pbr"] = fund.get("pbr")
             h["eps"] = fund.get("eps")
 
-        # 이평선 계산 (모든 종목 대상)
         hist = fetch_history(h.get("yahoo"), h.get("fdr"))
         ma = compute_moving_averages(hist)
         if ma:
             ma_map[h["name"]] = ma
 
-        # 뉴스 (개별주만)
         if h.get("category") == "Stock":
             if h["market"] == "US" and h.get("yahoo"):
                 news_map[h["name"]] = fetch_news_us(h["yahoo"], limit=5)
@@ -593,7 +695,7 @@ def render_html(data: dict) -> str:
 
 
 def main():
-    print(f"=== {datetime.now(KST).isoformat()} 갱신 시작 ===")
+    print(f"=== {datetime.now(KST).isoformat()} 갱신 시작 (v5) ===")
 
     cfg = json.loads((ROOT / "portfolio_data.json").read_text(encoding="utf-8"))
 
@@ -604,16 +706,16 @@ def main():
     holdings, news_map, ma_map = enrich_holdings(cfg["holdings"])
     accounts = build_account_summary(holdings, fx)
 
-    print("[M7] 수집...")
+    print("[M7] 수집 (한글 뉴스 포함)...")
     m7 = fetch_m7_daily()
 
-    print("[FLOW] 수집...")
+    print("[FLOW] 수집 (네이버 모바일 API)...")
     flow = fetch_market_flow()
 
-    print("[SECTOR] 수집...")
+    print("[SECTOR] 수집 (네이버 sise_group)...")
     sectors = fetch_sector_indices()
 
-    print("[KEYWORDS] 수집...")
+    print("[KEYWORDS] 수집 (네이버 sise_quant/rise/fall + theme)...")
     keywords = {
         "top_value": fetch_top_value_stocks(limit=10),
         "top_gainers": fetch_top_change_stocks(limit=5, ascending=False),
